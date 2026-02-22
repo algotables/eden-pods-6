@@ -44,10 +44,21 @@ function buildNote(type: string, props: Record<string, unknown>): Uint8Array {
   );
 }
 
-function parseNote(b64: string): Record<string, unknown> | null {
+function parseNote(note: unknown): Record<string, unknown> | null {
   try {
-    const decoded = atob(b64);
-    const obj = JSON.parse(decoded);
+    let str: string;
+
+    if (note instanceof Uint8Array) {
+      // algosdk v3 indexer returns note as raw bytes
+      str = new TextDecoder().decode(note);
+    } else if (typeof note === "string") {
+      // fallback: base64 string (older SDK behaviour)
+      str = atob(note);
+    } else {
+      return null;
+    }
+
+    const obj = JSON.parse(str);
     if (obj?.standard === "arc69" && obj?.properties?.eden_type)
       return obj.properties as Record<string, unknown>;
     return null;
