@@ -56,61 +56,83 @@ interface AppCtxType {
 
 const AppCtx = createContext<AppCtxType | null>(null);
 
-// ── localStorage helpers ──────────────────────────────────────────────────────
+// ── cache helpers — CONFIRMED throws only, never pending ──────────────────────
 
-function throwsCacheKey(address: string) {
-  return `eden-throws-${address}`;
+function cacheKey(address: string) {
+  return `eden-confirmed-${address}`;
 }
 
-function loadCachedThrows(address: string): UnifiedThrow[] {
+function loadConfirmedCache(address: string): UnifiedThrow[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = localStorage.getItem(throwsCacheKey(address));
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
+    const raw = localStorage.getItem(cacheKey(address));
+    if (!raw) return [];
+    // Always strip isPending when reading from cache
+    const parsed: UnifiedThrow[] = JSON.parse(raw);
+    return parsed.map((t) => ({ ...t, isPending: false }));
+  } catch {
+    return [];
+  }
 }
 
-function saveCachedThrows(address: string, throws: UnifiedThrow[]) {
+function saveConfirmedCache(address: string, throws: UnifiedThrow[]) {
   if (typeof window === "undefined") return;
   try {
-    localStorage.setItem(throwsCacheKey(address), JSON.stringify(throws));
+    // Never save pending throws to confirmed cache
+    const confirmed = throws
+      .filter((t) => !t.isPending && t.asaId > 0)
+      .map((t) => ({ ...t, isPending: false }));
+    localStorage.setItem(cacheKey(address), JSON.stringify(confirmed));
   } catch {}
 }
+
+// ── pending helpers — separate key, wiped on confirm ─────────────────────────
 
 function pendingKey(address: string) {
   return `eden-pending-${address}`;
 }
 
-function loadPendingThrows(address: string): UnifiedThrow[] {
+function loadPendingCache(address: string): UnifiedThrow[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(pendingKey(address));
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
+    if (!raw) return [];
+    const parsed: UnifiedThrow[] = JSON.parse(raw);
+    return parsed.map((t) => ({ ...t, isPending: true }));
+  } catch {
+    return [];
+  }
 }
 
-function savePendingThrows(address: string, throws: UnifiedThrow[]) {
+function savePendingCache(address: string, throws: UnifiedThrow[]) {
   if (typeof window === "undefined") return;
   try {
-    if (throws.length === 0) localStorage.removeItem(pendingKey(address));
-    else localStorage.setItem(pendingKey(address), JSON.stringify(throws));
+    if (throws.length === 0) {
+      localStorage.removeItem(pendingKey(address));
+    } else {
+      localStorage.setItem(pendingKey(address), JSON.stringify(throws));
+    }
   } catch {}
 }
 
-// ── Provider ──────────────────────────────────────────────────────────────────
+// ── provider ──────────────────────────────────────────────────────────────────
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const { address } = useWallet();
 
   const [confirmedThrows, setConfirmedThrows] = useState<UnifiedThrow[]>([]);
-  const [pendingThrows, setPendingThrows] = useState<UnifiedThrow[]>([]);
-  const [throwsLoading, setThrowsLoading] = useState(false);
-  const [throwsError, setThrowsError] = useState<string | null>(null);
+  const [pendingThrows, setPendingThrows]     = useState<UnifiedThrow[]>([]);
+  const [throwsLoading, setThrowsLoading]     = useState(false);
+  const [throwsError, setThrowsError]         = useState<string | null>(null);
   const [onChainHarvests, setOnChainHarvests] = useState<OnChainHarvest[]>([]);
-  const [local, setLocal] = useState<LocalState>({ observations: [], harvests: [], notifications: [] });
+  const [local, setLocal] = useState<LocalState>({
+    observations: [],
+    harvests: [],
+    notifications: [],
+  });
 
   const isFetching = useRef(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -118,11 +140,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => { mountedRef.current = false; };
   }, []);
 
-  // ── local state ────────────────────────────────────────────────────────────
+  // ── local storage reload ───────────────────────────────────────────────────
 
-  const reload = useCallback(() => {
-    setLocal(loadLocal());
-  }, []);
+  const reload = useCallback(() => setLocal(loadLocal()), []);
 
   useEffect(() => {
     reload();
@@ -130,7 +150,86 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(t);
   }, [reload]);
 
-  // ── on address change: load from cache immediately ─────────────────────────
+  // ── stop polling ───────────────────────────────────────────────────────────
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // ── core fetch from chain ──────────────────────────────────────────────────
+
+  const doFetch = useCallback(async (addr: string): Promise<UnifiedThrow[]> => {
+    const [fetched, harvests] = await Promise.all([
+      fetchThrowsForAddress(addr),
+      fetchHarvestsForAddress(addr),
+    ]);
+
+    const unified: UnifiedThrow[] = fetched.map((t) => ({
+      ...t,
+      localId: `chain-${t.asaId}`,
+      isPending: false, // always false for chain data
+    }));
+
+    if (!mountedRef.current) return unified;
+
+    // Save confirmed cache — no pending items ever go here
+    saveConfirmedCache(addr, unified);
+    setConfirmedThrows(unified);
+    setOnChainHarvests(harvests);
+
+    // Remove any pending throws that are now confirmed on chain
+    setPendingThrows((prev) => {
+      const confirmedAsaIds = new Set(unified.map((t) => t.asaId));
+      const stillPending = prev.filter(
+        (p) => p.asaId === 0 || !confirmedAsaIds.has(p.asaId)
+      );
+      savePendingCache(addr, stillPending);
+      if (stillPending.length === 0) stopPolling();
+      return stillPending;
+    });
+
+    // Seed notifications
+    for (const t of unified) {
+      seedNotifications(`chain-${t.asaId}`, t.throwDate, t.growthModelId);
+    }
+    reload();
+
+    return unified;
+  }, [reload, stopPolling]);
+
+  // ── polling after a new throw ──────────────────────────────────────────────
+
+  const startPolling = useCallback((addr: string) => {
+    stopPolling();
+    let ticks = 0;
+
+    pollRef.current = setInterval(async () => {
+      ticks++;
+
+      // Hard stop after 24 ticks (2 minutes)
+      if (ticks > 24) {
+        stopPolling();
+        // Force-clear pending so spinner never shows forever
+        setPendingThrows([]);
+        savePendingCache(addr, []);
+        return;
+      }
+
+      try {
+        await doFetch(addr);
+        // doFetch clears pendingThrows and calls stopPolling if empty
+      } catch {
+        // keep polling — indexer may be briefly unavailable
+      }
+    }, 5000);
+  }, [stopPolling, doFetch]);
+
+  useEffect(() => () => stopPolling(), [stopPolling]);
+
+  // ── react to wallet connect / disconnect ───────────────────────────────────
 
   useEffect(() => {
     if (!address) {
@@ -141,76 +240,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    // Instantly show cached throws (so UI is populated before fetch completes)
-    const cached = loadCachedThrows(address);
-    if (cached.length > 0) {
-      setConfirmedThrows(cached);
-    }
+    // 1. Load confirmed cache immediately — these show right away, no spinner
+    const cached = loadConfirmedCache(address);
+    setConfirmedThrows(cached);
 
-    // Also restore any pending throws for this address
-    const pending = loadPendingThrows(address);
+    // 2. Load pending cache — these show with confirming badge
+    const pending = loadPendingCache(address);
     setPendingThrows(pending);
 
-    // Then fetch fresh from chain in background
-    doFetch(address);
+    // 3. Fetch fresh from chain in background (silent — no loading spinner
+    //    since we already have cached data)
+    isFetching.current = false;
+    doFetch(address).catch((e) => {
+      if (mountedRef.current) {
+        setThrowsError(e instanceof Error ? e.message : "Fetch failed");
+      }
+    });
 
-    // If there were pending throws, start polling
+    // 4. If there were pending throws, resume polling
     if (pending.length > 0) {
       startPolling(address);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);
 
-  // ── fetch from chain ───────────────────────────────────────────────────────
-
-  const doFetch = useCallback(async (addr: string) => {
-    if (isFetching.current) return;
-    isFetching.current = true;
-
-    try {
-      const [fetched, harvests] = await Promise.all([
-        fetchThrowsForAddress(addr),
-        fetchHarvestsForAddress(addr),
-      ]);
-
-      if (!mountedRef.current) return;
-
-      const unified: UnifiedThrow[] = fetched.map((t) => ({
-        ...t,
-        localId: `chain-${t.asaId}`,
-        isPending: false,
-      }));
-
-      // Save to cache so next login is instant
-      saveCachedThrows(addr, unified);
-      setConfirmedThrows(unified);
-      setOnChainHarvests(harvests);
-
-      // Clear any pending throws that are now confirmed
-      if (unified.length > 0) {
-        setPendingThrows((prev) => {
-          const confirmedAsaIds = new Set(unified.map((t) => t.asaId));
-          const stillPending = prev.filter(
-            (p) => p.asaId === 0 || !confirmedAsaIds.has(p.asaId)
-          );
-          savePendingThrows(addr, stillPending);
-          return stillPending;
-        });
-      }
-
-      // Seed notifications
-      for (const t of unified) {
-        seedNotifications(`chain-${t.asaId}`, t.throwDate, t.growthModelId);
-      }
-      reload();
-    } catch (e) {
-      if (mountedRef.current) {
-        setThrowsError(e instanceof Error ? e.message : "Fetch failed");
-      }
-    } finally {
-      isFetching.current = false;
-    }
-  }, [reload]);
+  // ── manual refresh ─────────────────────────────────────────────────────────
 
   const refreshThrows = useCallback(async () => {
     if (!address) return;
@@ -218,79 +272,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setThrowsError(null);
     try {
       await doFetch(address);
+    } catch (e) {
+      if (mountedRef.current) {
+        setThrowsError(e instanceof Error ? e.message : "Fetch failed");
+      }
     } finally {
       if (mountedRef.current) setThrowsLoading(false);
     }
   }, [address, doFetch]);
 
-  // ── polling ────────────────────────────────────────────────────────────────
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  const startPolling = useCallback((addr: string) => {
-    stopPolling();
-    let ticks = 0;
-
-    pollRef.current = setInterval(async () => {
-      ticks++;
-
-      // Stop after 24 ticks = 2 minutes
-      if (ticks > 24) {
-        stopPolling();
-        // Clear pending regardless — don't leave spinner forever
-        setPendingThrows([]);
-        savePendingThrows(addr, []);
-        return;
-      }
-
-      try {
-        const fetched = await fetchThrowsForAddress(addr);
-        if (!mountedRef.current) return;
-
-        if (fetched.length > 0) {
-          const unified: UnifiedThrow[] = fetched.map((t) => ({
-            ...t,
-            localId: `chain-${t.asaId}`,
-            isPending: false,
-          }));
-
-          saveCachedThrows(addr, unified);
-          setConfirmedThrows(unified);
-
-          // Clear ALL pending — they're confirmed
-          setPendingThrows([]);
-          savePendingThrows(addr, []);
-          stopPolling();
-
-          // Seed notifications
-          for (const t of unified) {
-            seedNotifications(`chain-${t.asaId}`, t.throwDate, t.growthModelId);
-          }
-          reload();
-        }
-      } catch {
-        // keep polling
-      }
-    }, 5000);
-  }, [stopPolling, reload]);
-
-  useEffect(() => {
-    return () => stopPolling();
-  }, [stopPolling]);
-
   // ── add pending throw ──────────────────────────────────────────────────────
 
   const addPendingThrow = useCallback((t: UnifiedThrow) => {
     if (!address) return;
-    const withFlag = { ...t, isPending: true };
+    const pending = { ...t, isPending: true };
     setPendingThrows((prev) => {
-      const next = [withFlag, ...prev];
-      savePendingThrows(address, next);
+      const next = [pending, ...prev];
+      savePendingCache(address, next);
       return next;
     });
     startPolling(address);
@@ -298,27 +296,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // ── observations / harvests ────────────────────────────────────────────────
 
-  const addObservation = useCallback((data: Omit<Observation, "id" | "observedAt">) => {
-    storeAddObs(data);
-    reload();
-  }, [reload]);
+  const addObservation = useCallback(
+    (data: Omit<Observation, "id" | "observedAt">) => {
+      storeAddObs(data); reload();
+    }, [reload]
+  );
 
-  const addLocalHarvest = useCallback((data: Omit<Harvest, "id" | "harvestedAt">) => {
-    storeAddHarvest(data);
-    reload();
-  }, [reload]);
+  const addLocalHarvest = useCallback(
+    (data: Omit<Harvest, "id" | "harvestedAt">) => {
+      storeAddHarvest(data); reload();
+    }, [reload]
+  );
 
-  const markRead = useCallback((id: string) => {
-    storeMark(id);
-    reload();
-  }, [reload]);
+  const markRead = useCallback((id: string) => { storeMark(id); reload(); }, [reload]);
+  const markAllReadFn = useCallback(() => { storeMarkAll(); reload(); }, [reload]);
 
-  const markAllReadFn = useCallback(() => {
-    storeMarkAll();
-    reload();
-  }, [reload]);
-
-  // ── merge throws ───────────────────────────────────────────────────────────
+  // ── merge — pending first, then confirmed, deduped ────────────────────────
 
   const confirmedAsaIds = new Set(confirmedThrows.map((t) => t.asaId));
   const filteredPending = pendingThrows.filter(
