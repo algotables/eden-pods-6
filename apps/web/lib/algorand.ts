@@ -2,9 +2,8 @@ import algosdk from "algosdk";
 
 export const EXPLORER_BASE = "https://testnet.explorer.perawallet.app";
 
-// Nodely free public endpoints — more reliable than algonode for indexer queries
-const ALGOD_SERVER   = "https://testnet-api.4160.nodely.io";
-const INDEXER_SERVER = "https://testnet-idx.4160.nodely.io";
+const ALGOD_SERVER   = "https://testnet-api.algonode.cloud";
+const INDEXER_SERVER = "https://testnet-idx.algonode.cloud";
 
 let _algod: algosdk.Algodv2 | null = null;
 let _indexer: algosdk.Indexer | null = null;
@@ -47,7 +46,8 @@ function buildNote(type: string, props: Record<string, unknown>): Uint8Array {
 
 function parseNote(b64: string): Record<string, unknown> | null {
   try {
-    const obj = JSON.parse(atob(b64));
+    const decoded = atob(b64);
+    const obj = JSON.parse(decoded);
     if (obj?.standard === "arc69" && obj?.properties?.eden_type)
       return obj.properties as Record<string, unknown>;
     return null;
@@ -172,32 +172,45 @@ export async function fetchThrowsForAddress(
   address: string
 ): Promise<OnChainThrow[]> {
   const out: OnChainThrow[] = [];
-  try {
-    const indexer = getIndexer();
-    const resp = await indexer.searchForAssets().creator(address).do();
-    const assets = (resp as { assets?: { index: number }[] }).assets ?? [];
+  const indexer = getIndexer();
 
-    for (const asset of assets) {
-      try {
-        const txResp = await indexer
-          .searchForTransactions()
-          .assetID(asset.index)
-          .txType("acfg")
-          .do();
-        const txns =
-          (txResp as { transactions?: Record<string, unknown>[] })
-            .transactions ?? [];
-        if (!txns.length) continue;
-        const latest = txns[txns.length - 1];
-        if (!latest.note) continue;
-        const props = parseNote(latest.note as string);
+  console.log("[fetchThrows] fetching assets for", address);
+
+  const resp = await indexer.searchForAssets().creator(address).do();
+  const assets = (resp as { assets?: { index: number }[] }).assets ?? [];
+
+  console.log("[fetchThrows] found", assets.length, "assets");
+
+  for (const asset of assets) {
+    try {
+      const txResp = await indexer
+        .searchForTransactions()
+        .assetID(asset.index)
+        .txType("acfg")
+        .do();
+      const txns =
+        (txResp as { transactions?: Record<string, unknown>[] })
+          .transactions ?? [];
+
+      if (!txns.length) {
+        console.log("[fetchThrows] no txns for asset", asset.index);
+        continue;
+      }
+
+      // Try all txns, not just the latest — find one with valid note
+      let found = false;
+      for (const tx of [...txns].reverse()) {
+        if (!tx.note) continue;
+        const props = parseNote(tx.note as string);
         if (!props || props.eden_type !== "throw") continue;
-        const rt = (latest["round-time"] as number) ?? 0;
+
+        const rt = (tx["round-time"] as number) ?? 0;
         out.push({
           asaId: asset.index,
-          txId: latest.id as string,
+          txId: tx.id as string,
           throwDate:
-            (props.throwDate as string) ?? new Date(rt * 1000).toISOString(),
+            (props.throwDate as string) ??
+            new Date(rt * 1000).toISOString(),
           podTypeId: (props.podTypeId as string) ?? "",
           podTypeName: (props.podTypeName as string) ?? "",
           podTypeIcon: (props.podTypeIcon as string) ?? "🌱",
@@ -208,14 +221,24 @@ export async function fetchThrowsForAddress(
           confirmedAt: new Date(rt * 1000).toISOString(),
           explorerUrl: explorerAssetUrl(asset.index),
         });
-      } catch {
-        // skip individual asset errors
+        found = true;
+        break;
       }
+
+      if (!found) {
+        console.log(
+          "[fetchThrows] asset", asset.index,
+          "has txns but no valid eden note. First note:",
+          txns[0]?.note
+        );
+      }
+    } catch (e) {
+      console.warn("[fetchThrows] error processing asset", asset.index, e);
     }
-  } catch (e) {
-    console.warn("fetchThrows failed:", e);
-    throw e; // re-throw so caller knows it failed
   }
+
+  console.log("[fetchThrows] returning", out.length, "throws");
+
   return out.sort(
     (a, b) =>
       new Date(b.throwDate).getTime() - new Date(a.throwDate).getTime()
@@ -235,7 +258,8 @@ export async function fetchHarvestsForAddress(
       .txType("pay")
       .do();
     const txns =
-      (resp as { transactions?: Record<string, unknown>[] }).transactions ?? [];
+      (resp as { transactions?: Record<string, unknown>[] }).transactions ??
+      [];
     for (const txn of txns) {
       if (!txn.note) continue;
       const props = parseNote(txn.note as string);
