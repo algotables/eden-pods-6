@@ -236,17 +236,18 @@ export async function fetchThrowsForAddress(
         break;
       }
 
-      if (!found) {
-        console.log(
-          "[fetchThrows] asset", asset.index,
-          "has txns but no valid eden note. First note:",
-          txns[0]?.note
-        );
-      }
-    } catch (e) {
-      console.warn("[fetchThrows] error processing asset", asset.index, e);
+if (!found) {
+  // Decode note for debugging
+  let notePreview = "none";
+  try {
+    if (txns[0]?.note instanceof Uint8Array) {
+      notePreview = new TextDecoder().decode(txns[0].note as Uint8Array).slice(0, 120);
+    } else if (typeof txns[0]?.note === "string") {
+      notePreview = atob(txns[0].note as string).slice(0, 120);
     }
-  }
+  } catch {}
+  console.log("[fetchThrows] asset", asset.index, "no valid eden note. Preview:", notePreview);
+}
 
   console.log("[fetchThrows] returning", out.length, "throws");
 
