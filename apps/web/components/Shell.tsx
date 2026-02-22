@@ -49,5 +49,37 @@ export default function Shell({
         <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-lg bg-white border-t border-eden-100 z-40">
           <div className="flex items-center justify-around py-2">
             {NAV.map(({ href, icon, label }) => {
-              const active = href === "/dashboard" ? pathname === href : pathname.startsWith(href);
+              const active =
+                href === "/dashboard"
+                  ? pathname === href
+                  : pathname.startsWith(href);
               return (
+                <Link
+                  key={href}
+                  href={href}
+                  className={cn(
+                    "flex flex-col items-center gap-0.5 px-4 py-2 rounded-2xl transition-all",
+                    active ? "bg-eden-100 text-eden-800" : "text-gray-500 hover:text-eden-600"
+                  )}
+                >
+                  <div className="relative">
+                    <span className="text-2xl">{icon}</span>
+                    {href === "/notifications" && unreadCount > 0 && (
+                      <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full" />
+                    )}
+                  </div>
+                  <span className={cn(
+                    "text-xs font-medium",
+                    active ? "text-eden-700" : "text-gray-500"
+                  )}>
+                    {label}
+                  </span>
+                </Link>
+              );
+            })}
+          </div>
+        </nav>
+      )}
+    </div>
+  );
+}
