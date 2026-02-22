@@ -44,15 +44,15 @@ function buildNote(type: string, props: Record<string, unknown>): Uint8Array {
   );
 }
 
+// algosdk v3 indexer returns note as Uint8Array (raw bytes), not base64
 function parseNote(note: unknown): Record<string, unknown> | null {
   try {
     let str: string;
 
     if (note instanceof Uint8Array) {
-      // algosdk v3 indexer returns note as raw bytes
       str = new TextDecoder().decode(note);
     } else if (typeof note === "string") {
-      // fallback: base64 string (older SDK behaviour)
+      // legacy base64 fallback
       str = atob(note);
     } else {
       return null;
@@ -185,7 +185,7 @@ export async function fetchThrowsForAddress(
   const out: OnChainThrow[] = [];
   const indexer = getIndexer();
 
-  console.log("[fetchThrows] fetching assets for", address);
+  console.log("[fetchThrows] fetching for", address);
 
   const resp = await indexer.searchForAssets().creator(address).do();
   const assets = (resp as { assets?: { index: number }[] }).assets ?? [];
@@ -203,21 +203,18 @@ export async function fetchThrowsForAddress(
         (txResp as { transactions?: Record<string, unknown>[] })
           .transactions ?? [];
 
-      if (!txns.length) {
-        console.log("[fetchThrows] no txns for asset", asset.index);
-        continue;
-      }
+      if (!txns.length) continue;
 
-      // Try all txns, not just the latest — find one with valid note
+      // Try each txn for a valid note
       let found = false;
       for (const tx of [...txns].reverse()) {
         if (!tx.note) continue;
-        const props = parseNote(tx.note as string);
+        const props = parseNote(tx.note);
         if (!props || props.eden_type !== "throw") continue;
 
         const rt = (tx["round-time"] as number) ?? 0;
         out.push({
-          asaId: asset.index,
+          asaId: Number(asset.index), // ensure number not bigint
           txId: tx.id as string,
           throwDate:
             (props.throwDate as string) ??
@@ -230,24 +227,30 @@ export async function fetchThrowsForAddress(
             (props.growthModelId as string) ?? "temperate-herb",
           thrownBy: (props.thrownBy as string) ?? address,
           confirmedAt: new Date(rt * 1000).toISOString(),
-          explorerUrl: explorerAssetUrl(asset.index),
+          explorerUrl: explorerAssetUrl(Number(asset.index)),
         });
         found = true;
+        console.log("[fetchThrows] ✓ parsed asset", asset.index, props.podTypeName);
         break;
       }
 
-if (!found) {
-  // Decode note for debugging
-  let notePreview = "none";
-  try {
-    if (txns[0]?.note instanceof Uint8Array) {
-      notePreview = new TextDecoder().decode(txns[0].note as Uint8Array).slice(0, 120);
-    } else if (typeof txns[0]?.note === "string") {
-      notePreview = atob(txns[0].note as string).slice(0, 120);
+      if (!found) {
+        // Show readable preview of what the note actually contains
+        const firstNote = txns[0]?.note;
+        let preview = "none";
+        try {
+          if (firstNote instanceof Uint8Array) {
+            preview = new TextDecoder().decode(firstNote).slice(0, 150);
+          } else if (typeof firstNote === "string") {
+            preview = atob(firstNote).slice(0, 150);
+          }
+        } catch {}
+        console.log("[fetchThrows] ✗ asset", asset.index, "note preview:", preview);
+      }
+    } catch (e) {
+      console.warn("[fetchThrows] error on asset", asset.index, e);
     }
-  } catch {}
-  console.log("[fetchThrows] asset", asset.index, "no valid eden note. Preview:", notePreview);
-}
+  }
 
   console.log("[fetchThrows] returning", out.length, "throws");
 
@@ -274,7 +277,7 @@ export async function fetchHarvestsForAddress(
       [];
     for (const txn of txns) {
       if (!txn.note) continue;
-      const props = parseNote(txn.note as string);
+      const props = parseNote(txn.note);
       if (!props || props.eden_type !== "harvest") continue;
       const rt = (txn["round-time"] as number) ?? 0;
       out.push({
